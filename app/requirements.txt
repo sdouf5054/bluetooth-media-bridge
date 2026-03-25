@@ -1,0 +1,18 @@
+# Bluetooth Media Bridge — Python dependencies
+#
+# Install: pip install -r requirements.txt
+
+# Qt GUI framework
+PySide6>=6.6
+
+# asyncio + Qt event loop integration
+qasync>=0.27
+
+# Windows SDK bindings (SMTC media controls)
+# Only needed on Windows; harmless to list on other platforms
+winsdk>=1.0.0b10; sys_platform == "win32"
+
+# --- Dev / optional ---
+# Icon generation (only needed if regenerating tray icons)
+# cairosvg>=2.7
+# Pillow>=10.0

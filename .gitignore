@@ -21,3 +21,5 @@ rtl8761bu_config
 __pycache__/
 *.pyc
 .venv/
+
+config.json
