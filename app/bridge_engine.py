@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional
 
 from .ipc_client import IPCClient
 from .process_manager import ProcessManager, ProcessState
+from .smtc_manager import SMTCManager, MediaAction
 
 logger = logging.getLogger(__name__)
 
@@ -96,9 +97,11 @@ class BridgeEngine:
         self,
         build_dir: Optional[Path] = None,
         on_log: Optional[Callable[[str], None]] = None,
+        enable_smtc: bool = True,
     ) -> None:
         self._build_dir = Path(build_dir) if build_dir else None
         self._on_log = on_log
+        self._enable_smtc = enable_smtc
 
         self._process = ProcessManager(
             build_dir=self._build_dir,
@@ -107,6 +110,8 @@ class BridgeEngine:
         )
         self._ipc = IPCClient(auto_reconnect=True)
         self._state = BridgeState()
+        self._smtc: Optional[SMTCManager] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Engine-level event callbacks: event_name -> [handlers]
         self._callbacks: dict[str, list[EngineCallback]] = {}
@@ -163,8 +168,13 @@ class BridgeEngine:
     async def start(self) -> None:
         """Start bt_bridge.exe and connect IPC."""
         logger.info("Engine starting")
+        self._loop = asyncio.get_event_loop()
         await self._process.start()
         self._set_connection(ConnectionState.INITIALIZING)
+
+        # Initialize SMTC if enabled
+        if self._enable_smtc:
+            await self._init_smtc()
 
         # Give the exe a moment to start its TCP server
         await asyncio.sleep(self.IPC_CONNECT_DELAY)
@@ -184,6 +194,9 @@ class BridgeEngine:
         logger.info("Engine stopping")
         await self._ipc.disconnect()
         await self._process.stop()
+        if self._smtc:
+            self._smtc.shutdown()
+            self._smtc = None
         self._state = BridgeState()
         self._set_connection(ConnectionState.IDLE)
 
@@ -223,7 +236,10 @@ class BridgeEngine:
     async def connect_ipc_only(self) -> None:
         """Connect IPC without managing the process (for testing)."""
         logger.info("Engine connecting IPC only (no process management)")
+        self._loop = asyncio.get_event_loop()
         self._set_connection(ConnectionState.INITIALIZING)
+        if self._enable_smtc:
+            await self._init_smtc()
         await self._ipc.connect_with_retry(max_attempts=self.IPC_CONNECT_MAX_ATTEMPTS)
 
     # -- internal: IPC event handlers ----------------------------------------
@@ -244,6 +260,9 @@ class BridgeEngine:
         self._state.playback = PlaybackStatus.UNKNOWN
         self._state.cover_art_path = None
         self._set_connection(ConnectionState.READY)
+        if self._smtc:
+            self._smtc.clear_display()
+            self._smtc.update_playback_status("stopped")
         logger.info("iPhone disconnected")
 
     def _on_metadata(self, _type: str, data: dict[str, Any]) -> None:
@@ -256,6 +275,12 @@ class BridgeEngine:
             track_id=data.get("track_id", 0),
         )
         logger.info("Metadata: %s", self._state.metadata.summary())
+        if self._smtc:
+            self._smtc.update_metadata(
+                title=self._state.metadata.title,
+                artist=self._state.metadata.artist,
+                album=self._state.metadata.album,
+            )
         self._emit("metadata", self._state.metadata)
 
     def _on_playback(self, _type: str, data: dict[str, Any]) -> None:
@@ -265,6 +290,8 @@ class BridgeEngine:
         except ValueError:
             self._state.playback = PlaybackStatus.UNKNOWN
         logger.info("Playback: %s", self._state.playback.value)
+        if self._smtc:
+            self._smtc.update_playback_status(self._state.playback.value)
         self._emit("playback", self._state.playback)
 
     def _on_volume(self, _type: str, data: dict[str, Any]) -> None:
@@ -284,6 +311,9 @@ class BridgeEngine:
                 "Cover art ready: %s (%d bytes)",
                 abs_path.name, data.get("size", 0),
             )
+            # Update SMTC thumbnail (async — fire and forget)
+            if self._smtc and self._loop:
+                self._loop.create_task(self._smtc.update_thumbnail(abs_path))
             self._emit("cover_art", abs_path)
         else:
             logger.warning("Cover art file not found: %s", abs_path)
@@ -316,6 +346,42 @@ class BridgeEngine:
         self._state = BridgeState()
         self._set_connection(ConnectionState.IDLE)
         self._emit("process_exit", code)
+
+    # -- internal: SMTC integration -------------------------------------------
+
+    async def _init_smtc(self) -> None:
+        """Initialize SMTC manager."""
+        self._smtc = SMTCManager(on_media_key=self._handle_media_key)
+        await self._smtc.initialize()
+        if self._smtc.initialized:
+            logger.info("SMTC integration active")
+        else:
+            logger.warning("SMTC integration unavailable")
+            self._smtc = None
+
+    def _handle_media_key(self, action: MediaAction) -> None:
+        """
+        Handle media key presses from SMTC.
+
+        Called from SMTC's button_pressed event (possibly on a different thread),
+        so we schedule the IPC command on the asyncio event loop.
+        """
+        if not self._loop:
+            return
+
+        cmd_map = {
+            MediaAction.PLAY: "play",
+            MediaAction.PAUSE: "pause",
+            MediaAction.STOP: "stop",
+            MediaAction.NEXT: "next",
+            MediaAction.PREVIOUS: "prev",
+        }
+        cmd = cmd_map.get(action)
+        if cmd:
+            logger.info("Media key → %s", cmd)
+            asyncio.run_coroutine_threadsafe(
+                self._ipc.send_command(cmd), self._loop
+            )
 
     # -- internal: state & events --------------------------------------------
 

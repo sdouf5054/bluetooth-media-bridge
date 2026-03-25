@@ -50,6 +50,7 @@ def make_engine(args: argparse.Namespace) -> BridgeEngine:
     return BridgeEngine(
         build_dir=build_dir,
         on_log=lambda line: print(f"  [{_ts()}] [exe] {line}"),
+        enable_smtc=not args.no_smtc,
     )
 
 
@@ -165,6 +166,11 @@ async def main() -> None:
         "--verbose", "-v",
         action="store_true",
         help="Enable debug logging",
+    )
+    parser.add_argument(
+        "--no-smtc",
+        action="store_true",
+        help="Disable SMTC integration (no media card in taskbar)",
     )
     args = parser.parse_args()
 
