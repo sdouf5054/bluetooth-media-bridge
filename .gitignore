@@ -1,0 +1,23 @@
+# Build artifacts
+**/build/
+*.exe
+*.a
+*.o
+*.obj
+*.wav
+*.pklg
+*.tlv
+
+# Firmware (별도 다운로드)
+rtl8761bu_fw
+rtl8761bu_config
+
+# IDE
+.vs/
+.vscode/
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+.venv/

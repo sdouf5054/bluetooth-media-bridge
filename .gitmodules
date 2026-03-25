@@ -1,0 +1,3 @@
+[submodule "bluetooth_bridge/btstack"]
+	path = bluetooth_bridge/btstack
+	url = https://github.com/sdouf5054/btstack.git
