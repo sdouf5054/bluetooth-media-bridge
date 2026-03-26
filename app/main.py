@@ -7,18 +7,6 @@ Responsibilities:
   - Bridge engine callbacks (plain Python) → Qt signals (thread-safe)
   - Handle startup options (--minimized, --startup, --ipc-only, --build-dir)
   - Graceful shutdown on quit
-
-Startup modes:
-  --startup    Launched by Windows startup registration. Implies --minimized.
-               Starts hidden to tray, engine auto-connects.
-  --minimized  Start minimized to system tray (no main window shown).
-
-Usage:
-    python -m app.main
-    python -m app.main --minimized
-    python -m app.main --startup
-    python -m app.main --ipc-only
-    python -m app.main --build-dir "C:\\path\\to\\build"
 """
 
 from __future__ import annotations
@@ -70,20 +58,17 @@ def _set_app_id() -> None:
 class _EngineBridge(QObject):
     """
     Bridges BridgeEngine callbacks (called from asyncio) to Qt signals.
-
-    Engine callbacks may fire from any context. Qt widgets must only be
-    updated from the main thread. This bridge re-emits every engine event
-    as a Qt signal, ensuring thread safety.
     """
 
     state_changed = Signal(str, str)     # (state_name, device_info)
     metadata_changed = Signal(str, str, str)  # (title, artist, album)
     playback_changed = Signal(str)       # status string
     cover_art_ready = Signal(str)        # file path as string
+    codec_changed = Signal(str)          # codec name ("SBC", "AAC")
     stream_started = Signal()
     stream_stopped = Signal()
     log_line = Signal(str)
-    process_exited = Signal(int)         # exit code (-1 if None)
+    process_exited = Signal(str)         # exit code as string (avoids int overflow on Windows)
 
     def __init__(self, engine: BridgeEngine, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -95,6 +80,7 @@ class _EngineBridge(QObject):
         engine.on("metadata", self._on_metadata)
         engine.on("playback", self._on_playback)
         engine.on("cover_art", self._on_cover_art)
+        engine.on("codec", self._on_codec)
         engine.on("stream_started", self._on_stream_started)
         engine.on("stream_stopped", self._on_stream_stopped)
         engine.on("log", self._on_log)
@@ -118,6 +104,9 @@ class _EngineBridge(QObject):
     def _on_cover_art(self, path: Path) -> None:
         self.cover_art_ready.emit(str(path))
 
+    def _on_codec(self, name: str) -> None:
+        self.codec_changed.emit(name)
+
     def _on_stream_started(self) -> None:
         self.stream_started.emit()
 
@@ -128,7 +117,7 @@ class _EngineBridge(QObject):
         self.log_line.emit(line)
 
     def _on_exit(self, code: int | None) -> None:
-        self.process_exited.emit(code if code is not None else -1)
+        self.process_exited.emit(str(code) if code is not None else "-1")
 
 
 # ── Application controller ─────────────────────────────────────────────────
@@ -136,9 +125,6 @@ class _EngineBridge(QObject):
 class Application:
     """
     Top-level application controller.
-
-    Owns all components and wires them together.
-    Uses qasync to run asyncio coroutines within the Qt event loop.
     """
 
     def __init__(self, args: argparse.Namespace) -> None:
@@ -155,6 +141,7 @@ class Application:
             build_dir=build_dir,
             enable_smtc=not args.no_smtc,
             auto_reconnect=self._config.get("auto_reconnect_last_device", True),
+            preferred_codec=self._config.get("preferred_codec", "both"),
         )
 
         # Qt components
@@ -183,6 +170,7 @@ class Application:
         # Engine bridge → Settings window
         bridge.state_changed.connect(settings.update_connection_state)
         bridge.state_changed.connect(self._on_state_for_device_info)
+        bridge.codec_changed.connect(self._on_codec_changed)
 
         # Engine bridge → Log window
         bridge.log_line.connect(log_win.append_line)
@@ -194,6 +182,9 @@ class Application:
         )
         bridge.playback_changed.connect(
             lambda s: log_win.append_line(f"[engine] Playback → {s}")
+        )
+        bridge.codec_changed.connect(
+            lambda c: log_win.append_line(f"[engine] Codec → {c}")
         )
         bridge.process_exited.connect(
             lambda c: log_win.append_line(f"[engine] Process exited (code={c})")
@@ -212,6 +203,7 @@ class Application:
         settings.connection_toggled.connect(self._toggle_connection)
         settings.connect_requested.connect(self._connect_bt)
         settings.disconnect_requested.connect(self._disconnect_bt)
+        settings.codec_changed.connect(self._on_codec_preference_changed)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -221,10 +213,6 @@ class Application:
 
         self._tray.show()
 
-        # Determine if we should start minimized:
-        # --startup flag (from Windows startup) implies minimized
-        # --minimized flag explicitly requests it
-        # config start_minimized is the default preference
         start_minimized = (
             self._args.startup
             or self._args.minimized
@@ -233,7 +221,6 @@ class Application:
         if not start_minimized:
             self._settings.show()
 
-        # Auto-connect unless disabled
         if self._config.get("auto_connect", True):
             await self._start_engine()
 
@@ -263,15 +250,12 @@ class Application:
             await self._engine.stop()
             self._engine_running = False
             self._settings.clear_device_info()
-            # Ensure UI reflects IDLE state even if engine events
-            # arrived out of order during shutdown
             self._settings.update_connection_state("IDLE", "")
             self._tray.update_state("IDLE", "")
 
     # ── Slot handlers (schedule async work from Qt signals) ─────────────────
 
     def _toggle_connection(self, connect: bool) -> None:
-        """Handle connect/disconnect toggle from tray or settings."""
         if self._loop is None:
             return
         if connect:
@@ -280,7 +264,6 @@ class Application:
             asyncio.ensure_future(self._stop_engine(), loop=self._loop)
 
     def _reconnect(self) -> None:
-        """Handle reconnect request."""
         if self._loop is None:
             return
 
@@ -292,7 +275,6 @@ class Application:
         asyncio.ensure_future(_do_reconnect(), loop=self._loop)
 
     def _disconnect_bt(self) -> None:
-        """Disconnect BT device but keep engine running."""
         if self._loop is None or not self._engine_running:
             return
         self._log_win.append_line("[app] Disconnecting BT device...")
@@ -301,7 +283,6 @@ class Application:
         )
 
     def _connect_bt(self) -> None:
-        """Manually trigger BT connection to last known device."""
         if self._loop is None or not self._engine_running:
             return
         self._log_win.append_line("[app] Connecting to last device...")
@@ -316,10 +297,33 @@ class Application:
             self._settings.update_device_info(
                 device_name=f"Device ({s.device_addr[:8]}...)" if s.device_addr else "Unknown",
                 device_addr=s.device_addr or "—",
-                codec="SBC",  # TODO: get actual codec from engine when available
+                codec=s.codec or "—",
             )
         elif state_name in ("IDLE", "READY", "INITIALIZING"):
             self._settings.clear_device_info()
+
+    def _on_codec_changed(self, codec_name: str) -> None:
+        """Update device info when codec is reported by bt_bridge."""
+        if self._engine.state.connection in (ConnectionState.CONNECTED, ConnectionState.STREAMING):
+            s = self._engine.state
+            self._settings.update_device_info(
+                device_name=f"Device ({s.device_addr[:8]}...)" if s.device_addr else "Unknown",
+                device_addr=s.device_addr or "—",
+                codec=codec_name or "—",
+            )
+
+    def _on_codec_preference_changed(self, codec: str) -> None:
+        """Handle codec selection change from settings UI."""
+        # Map UI values to bt_bridge --codec values
+        codec_map = {"SBC": "SBC", "AAC": "both"}
+        bt_codec = codec_map.get(codec, "both")
+        self._engine.preferred_codec = bt_codec
+        self._config["preferred_codec"] = bt_codec
+        self._config.save()
+        self._log_win.append_line(
+            f"[app] Codec preference changed to {codec} (bt_bridge: --codec {bt_codec}). "
+            f"Restart engine to apply."
+        )
 
     def _quit(self) -> None:
         """Graceful shutdown."""
@@ -377,29 +381,22 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # --startup implies --minimized
     if args.startup:
         args.minimized = True
 
-    # Logging
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
 
-    # Verify startup registration path (auto-fix if exe was moved)
     verify_startup_path()
-
-    # Windows app identity (must be before QApplication)
     _set_app_id()
 
-    # Qt application
     qt_app = QApplication(sys.argv)
     qt_app.setApplicationName("Bluetooth Media Bridge")
     qt_app.setQuitOnLastWindowClosed(False)
 
-    # asyncio + Qt integration via qasync
     try:
         import qasync
     except ImportError:
@@ -412,10 +409,8 @@ def main() -> None:
     loop = qasync.QEventLoop(qt_app)
     asyncio.set_event_loop(loop)
 
-    # Create application controller
     app_ctrl = Application(args)
 
-    # Run
     with loop:
         loop.run_until_complete(app_ctrl.start())
         loop.run_forever()

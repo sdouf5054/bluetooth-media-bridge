@@ -3,7 +3,7 @@ bridge_engine.py — Central orchestrator for Bluetooth Media Bridge.
 
 Responsibilities:
   - Coordinate ProcessManager (exe lifecycle) and IPCClient (comms)
-  - Maintain authoritative state (connection, metadata, playback)
+  - Maintain authoritative state (connection, metadata, playback, codec)
   - Resolve cover art file paths (build_dir relative → absolute)
   - Expose a clean async API for upper layers (SMTC, GUI)
 """
@@ -75,6 +75,7 @@ class BridgeState:
     device_addr: str = ""        # connected iPhone address
     local_addr: str = ""         # dongle BT address
     cover_art_path: Optional[Path] = None
+    codec: str = ""              # active codec: "SBC", "AAC", or ""
 
 
 class BridgeEngine:
@@ -99,16 +100,19 @@ class BridgeEngine:
         on_log: Optional[Callable[[str], None]] = None,
         enable_smtc: bool = True,
         auto_reconnect: bool = True,
+        preferred_codec: str = "both",
     ) -> None:
         self._build_dir = Path(build_dir) if build_dir else None
         self._on_log = on_log
         self._enable_smtc = enable_smtc
         self._auto_reconnect = auto_reconnect
+        self._preferred_codec = preferred_codec
 
         self._process = ProcessManager(
             build_dir=self._build_dir,
             on_log=self._handle_process_log,
             on_exit=self._handle_process_exit,
+            preferred_codec=self._preferred_codec,
         )
         self._ipc = IPCClient(auto_reconnect=True)
         self._state = BridgeState()
@@ -128,6 +132,7 @@ class BridgeEngine:
         self._ipc.on("cover_art", self._on_cover_art)
         self._ipc.on("stream_started", self._on_stream_started)
         self._ipc.on("stream_stopped", self._on_stream_stopped)
+        self._ipc.on("codec", self._on_codec)
         self._ipc.on("_disconnected", self._on_ipc_disconnected)
         self._ipc.on("_connected", self._on_ipc_connected)
 
@@ -141,6 +146,16 @@ class BridgeEngine:
     def build_dir(self) -> Path:
         return self._process.build_dir
 
+    @property
+    def preferred_codec(self) -> str:
+        return self._preferred_codec
+
+    @preferred_codec.setter
+    def preferred_codec(self, value: str) -> None:
+        """Set preferred codec. Requires restart to take effect."""
+        self._preferred_codec = value
+        self._process.preferred_codec = value
+
     # -- event registration --------------------------------------------------
 
     def on(self, event_name: str, callback: EngineCallback) -> None:
@@ -152,6 +167,7 @@ class BridgeEngine:
           metadata(meta: MediaMetadata)
           playback(status: PlaybackStatus)
           cover_art(path: Path)
+          codec(name: str)
           stream_started()
           stream_stopped()
           log(line: str)
@@ -194,13 +210,7 @@ class BridgeEngine:
     SHUTDOWN_GRACE_PERIOD = 1.5
 
     async def stop(self) -> None:
-        """Shut down everything cleanly.
-
-        Sends a 'shutdown' command to bt_bridge first, giving it time to
-        cleanly disconnect from the iPhone (HCI power off) before killing
-        the process. Without this, the iPhone sees a phantom connection
-        until its supervision timeout expires (~20s).
-        """
+        """Shut down everything cleanly."""
         logger.info("Engine stopping")
 
         # Tell bt_bridge to power off HCI (clean BT disconnect)
@@ -281,6 +291,7 @@ class BridgeEngine:
         self._state.metadata = MediaMetadata()
         self._state.playback = PlaybackStatus.UNKNOWN
         self._state.cover_art_path = None
+        self._state.codec = ""
         self._set_connection(ConnectionState.READY)
         if self._smtc:
             self._smtc.clear_display()
@@ -324,7 +335,6 @@ class BridgeEngine:
         rel_path = data.get("path", "")
         if not rel_path:
             return
-        # cover.jpg is in the build directory (bt_bridge.exe's cwd)
         abs_path = self._process.build_dir / rel_path
         if abs_path.is_file():
             self._state.cover_art_path = abs_path
@@ -332,12 +342,18 @@ class BridgeEngine:
                 "Cover art ready: %s (%d bytes)",
                 abs_path.name, data.get("size", 0),
             )
-            # Update SMTC thumbnail (async — fire and forget)
             if self._smtc and self._loop:
                 self._loop.create_task(self._smtc.update_thumbnail(abs_path))
             self._emit("cover_art", abs_path)
         else:
             logger.warning("Cover art file not found: %s", abs_path)
+
+    def _on_codec(self, _type: str, data: dict[str, Any]) -> None:
+        """Handle codec event from bt_bridge: {"type":"codec","name":"AAC"}"""
+        codec_name = data.get("name", "")
+        self._state.codec = codec_name
+        logger.info("Codec: %s", codec_name)
+        self._emit("codec", codec_name)
 
     def _on_stream_started(self, _type: str, _data: dict[str, Any]) -> None:
         if self._state.connection == ConnectionState.CONNECTED:
@@ -351,7 +367,6 @@ class BridgeEngine:
 
     def _on_ipc_connected(self, _type: str, _data: dict[str, Any]) -> None:
         logger.info("IPC connection established")
-        # Send auto_reconnect preference to bt_bridge
         if self._loop:
             self._loop.create_task(
                 self._ipc.send_command(
@@ -389,12 +404,7 @@ class BridgeEngine:
             self._smtc = None
 
     def _handle_media_key(self, action: MediaAction) -> None:
-        """
-        Handle media key presses from SMTC.
-
-        Called from SMTC's button_pressed event (possibly on a different thread),
-        so we schedule the IPC command on the asyncio event loop.
-        """
+        """Handle media key presses from SMTC."""
         if not self._loop:
             return
 

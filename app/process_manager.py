@@ -5,6 +5,7 @@ Responsibilities:
   - Start / stop / restart bt_bridge.exe
   - Capture stdout/stderr via async readers, forward to callbacks
   - Monitor process health, emit events on unexpected exit
+  - Pass --codec argument to bt_bridge.exe based on configuration
 """
 
 from __future__ import annotations
@@ -43,11 +44,13 @@ class ProcessManager:
         exe_name: str = "bt_bridge.exe",
         on_log: Optional[Callable[[str], None]] = None,
         on_exit: Optional[Callable[[int | None], None]] = None,
+        preferred_codec: str = "both",
     ) -> None:
         self.build_dir = Path(build_dir) if build_dir else _DEFAULT_BUILD_DIR
         self.exe_path = self.build_dir / exe_name
         self._on_log = on_log
         self._on_exit = on_exit
+        self._preferred_codec = preferred_codec
         self._process: Optional[asyncio.subprocess.Process] = None
         self._state = ProcessState.STOPPED
         self._monitor_task: Optional[asyncio.Task] = None
@@ -63,6 +66,15 @@ class ProcessManager:
     def pid(self) -> Optional[int]:
         return self._process.pid if self._process else None
 
+    @property
+    def preferred_codec(self) -> str:
+        return self._preferred_codec
+
+    @preferred_codec.setter
+    def preferred_codec(self, value: str) -> None:
+        """Set preferred codec. Takes effect on next start/restart."""
+        self._preferred_codec = value
+
     # -- lifecycle -----------------------------------------------------------
 
     async def start(self) -> None:
@@ -75,16 +87,30 @@ class ProcessManager:
             raise FileNotFoundError(f"Executable not found: {self.exe_path}")
 
         self._state = ProcessState.STARTING
-        logger.info("Starting %s (cwd=%s)", self.exe_path.name, self.build_dir)
+
+        # Build command line with --codec argument
+        cmd_args = [str(self.exe_path)]
+        if self._preferred_codec and self._preferred_codec != "both":
+            cmd_args.extend(["--codec", self._preferred_codec])
+        else:
+            cmd_args.extend(["--codec", "both"])
+
+        logger.info(
+            "Starting %s (cwd=%s, codec=%s)",
+            self.exe_path.name, self.build_dir, self._preferred_codec,
+        )
 
         self._process = await asyncio.create_subprocess_exec(
-            str(self.exe_path),
+            *cmd_args,
             cwd=str(self.build_dir),
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            # On Windows, CREATE_NEW_PROCESS_GROUP allows graceful termination
+            # CREATE_NO_WINDOW: hide console window
+            # Note: CREATE_NEW_PROCESS_GROUP can cause ACCESS_VIOLATION
+            # when btstack_stdin_windows tries to access console input
             creationflags=(
-                getattr(signal, "CREATE_NEW_PROCESS_GROUP", 0)
+                0x08000000  # CREATE_NO_WINDOW
                 if os.name == "nt"
                 else 0
             ),

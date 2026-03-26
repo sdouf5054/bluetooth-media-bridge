@@ -36,8 +36,9 @@ DEFAULTS: dict[str, Any] = {
     "auto_reconnect_last_device": True,  # auto-connect to last paired device on startup
     "build_dir": str(_DEFAULT_BUILD_DIR),
 
-    # Audio
-    "preferred_codec": "SBC",  # "SBC" or "AAC" (AAC not yet supported)
+    # Audio / Codec
+    "preferred_codec": "both",  # "SBC", "AAC", or "both" (let iPhone choose)
+
     # UI / Behavior
     "start_minimized": True,
     "launch_at_startup": False,
@@ -64,10 +65,8 @@ _REG_NAME = "BluetoothMediaBridge"
 def _get_startup_command() -> str:
     """Build the correct startup command for the current environment."""
     if getattr(sys, "frozen", False):
-        # Frozen (PyInstaller exe) — register exe directly
         return f'"{sys.executable}" --startup'
     else:
-        # Script mode — prefer pythonw.exe to avoid console window
         python_dir = os.path.dirname(sys.executable)
         pythonw = os.path.join(python_dir, "pythonw.exe")
         if not os.path.exists(pythonw):
@@ -121,19 +120,13 @@ def _unregister_startup() -> None:
             winreg.DeleteValue(key, _REG_NAME)
         logger.info("Startup registration removed")
     except FileNotFoundError:
-        pass  # Already not registered
+        pass
     except Exception:
         logger.exception("Failed to unregister startup")
 
 
 def verify_startup_path() -> None:
-    """
-    Auto-fix startup registry if the exe/script path has changed.
-
-    Call once at app startup. If the app is registered but the registered
-    command doesn't match the current path (e.g. exe was moved or updated),
-    the registration is silently updated.
-    """
+    """Auto-fix startup registry if the exe/script path has changed."""
     if sys.platform != "win32":
         return
     if not _is_startup_registered():
@@ -149,8 +142,6 @@ def verify_startup_path() -> None:
         return
 
     expected_cmd = _get_startup_command()
-
-    # Case-insensitive comparison, ignoring quote variations
     if registered_cmd.strip('"').lower() != expected_cmd.strip('"').lower():
         logger.info(
             "Startup path changed, updating: %s → %s",
@@ -167,7 +158,7 @@ class AppConfig:
 
     Usage:
         cfg = AppConfig()              # loads from default path
-        codec = cfg["preferred_codec"] # -> "SBC"
+        codec = cfg["preferred_codec"] # -> "both"
         cfg["preferred_codec"] = "AAC"
         cfg.save()
     """

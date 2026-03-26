@@ -3,15 +3,9 @@ settings_window.py — Compact settings window for Bluetooth Media Bridge.
 
 Responsibilities:
   - Show connection status and device info (engine start/stop + connect/disconnect)
-  - Codec selection, startup, minimize, auto-reconnect options
+  - Codec selection (SBC/AAC), startup, minimize, auto-reconnect options
   - "Debug log" button opens LogWindow
   - Close button → hide to tray (not quit)
-
-Layout sections (top to bottom):
-  1. Title bar with app name + connection indicator
-  2. Connection card (status, device, address, codec) + engine/connect buttons
-  3. Options (codec, launch at startup, start minimized, auto-reconnect)
-  4. Footer (debug log button, version)
 """
 
 from __future__ import annotations
@@ -74,7 +68,7 @@ class SettingsWindow(QWidget):
     Compact settings window.
 
     Signals:
-      - codec_changed(str): user selected a different codec
+      - codec_changed(str): user selected a different codec ("SBC" or "AAC")
       - connection_toggled(bool): engine start (True) / stop (False)
       - connect_requested: manually trigger BT connection
       - disconnect_requested: disconnect BT only, keep engine
@@ -89,7 +83,7 @@ class SettingsWindow(QWidget):
     open_log_requested = Signal()
     closed = Signal()
 
-    VERSION = "0.1.0"
+    VERSION = "0.2.0"
 
     def __init__(
         self,
@@ -163,12 +157,11 @@ class SettingsWindow(QWidget):
         self._engine_btn.clicked.connect(self._on_engine_toggle)
         btn_row.addWidget(self._engine_btn, 1)
 
-        # This button changes role: Connect (READY) / Disconnect (CONNECTED)
         self._conn_action_btn = QPushButton("Connect")
         self._conn_action_btn.setObjectName("connActionBtn")
         self._conn_action_btn.setFixedHeight(32)
         self._conn_action_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._conn_action_btn.setVisible(False)  # hidden in IDLE
+        self._conn_action_btn.setVisible(False)
         self._conn_action_btn.clicked.connect(self._on_conn_action)
         btn_row.addWidget(self._conn_action_btn, 1)
 
@@ -214,8 +207,11 @@ class SettingsWindow(QWidget):
         self._codec_combo = QComboBox()
         self._codec_combo.addItems(["SBC", "AAC"])
         self._codec_combo.setFixedWidth(90)
-        self._codec_combo.setEnabled(False)  # AAC not yet supported
-        self._codec_combo.setToolTip("AAC support coming soon")
+        self._codec_combo.setToolTip(
+            "SBC: mandatory codec, always works\n"
+            "AAC: higher quality, iPhone preferred\n"
+            "Changing codec requires engine restart"
+        )
         self._codec_combo.currentTextChanged.connect(self._on_codec_changed)
         codec_row.addWidget(self._codec_combo)
         opt_layout.addLayout(codec_row)
@@ -310,7 +306,6 @@ class SettingsWindow(QWidget):
             QPushButton:hover {
                 background-color: palette(midlight);
             }
-            /* Engine and Connect/Disconnect buttons — styled dynamically */
             #engineBtn, #connActionBtn {
                 font-weight: 600;
                 font-size: 12px;
@@ -330,10 +325,12 @@ class SettingsWindow(QWidget):
 
     def _load_config(self) -> None:
         """Populate UI from config."""
-        codec = self._config.get("preferred_codec", "SBC")
-        idx = self._codec_combo.findText(codec)
-        if idx >= 0:
-            self._codec_combo.setCurrentIndex(idx)
+        # Codec: map config value to UI display
+        codec_pref = self._config.get("preferred_codec", "both")
+        if codec_pref == "both" or codec_pref == "AAC":
+            self._codec_combo.setCurrentText("AAC")
+        else:
+            self._codec_combo.setCurrentText("SBC")
 
         self._startup_cb.setChecked(self._config.get("launch_at_startup", False))
         self._minimized_cb.setChecked(self._config.get("start_minimized", True))
@@ -341,7 +338,6 @@ class SettingsWindow(QWidget):
 
     def _save_config(self) -> None:
         """Persist current settings."""
-        self._config["preferred_codec"] = self._codec_combo.currentText()
         self._config["launch_at_startup"] = self._startup_cb.isChecked()
         self._config["start_minimized"] = self._minimized_cb.isChecked()
         self._config["auto_reconnect_last_device"] = self._auto_reconnect_cb.isChecked()
@@ -402,11 +398,8 @@ class SettingsWindow(QWidget):
 
         # ── Connect / Disconnect button ──
         if state_name == "IDLE":
-            # Engine off — hide the action button entirely
             self._conn_action_btn.setVisible(False)
-
         elif is_connected:
-            # Device connected — show Disconnect (red)
             self._conn_action_btn.setText("Disconnect")
             self._conn_action_btn.setVisible(True)
             self._conn_action_btn.setEnabled(True)
@@ -418,10 +411,7 @@ class SettingsWindow(QWidget):
                 }
                 #connActionBtn:hover { background-color: #C43E3E; }
             """)
-
         else:
-            # Engine running but not connected (READY / INITIALIZING)
-            # Show Connect button (blue) to manually trigger reconnection
             self._conn_action_btn.setText("Connect")
             self._conn_action_btn.setVisible(True)
             self._conn_action_btn.setEnabled(state_name == "READY")
@@ -435,7 +425,6 @@ class SettingsWindow(QWidget):
                     #connActionBtn:hover { background-color: #2E78C4; }
                 """)
             else:
-                # INITIALIZING — show but disabled
                 self._conn_action_btn.setStyleSheet("""
                     #connActionBtn {
                         background-color: #A0AEC0; color: white;
@@ -468,15 +457,12 @@ class SettingsWindow(QWidget):
         self.connection_toggled.emit(not is_running)
 
     def _on_conn_action(self) -> None:
-        """Handle the Connect/Disconnect button based on current state."""
         if self._is_connected:
             self.disconnect_requested.emit()
         else:
             self.connect_requested.emit()
 
     def _on_codec_changed(self, text: str) -> None:
-        self._config["preferred_codec"] = text
-        self._config.save()
         self.codec_changed.emit(text)
 
     def _on_startup_toggled(self, checked: bool) -> None:
