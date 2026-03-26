@@ -98,10 +98,12 @@ class BridgeEngine:
         build_dir: Optional[Path] = None,
         on_log: Optional[Callable[[str], None]] = None,
         enable_smtc: bool = True,
+        auto_reconnect: bool = True,
     ) -> None:
         self._build_dir = Path(build_dir) if build_dir else None
         self._on_log = on_log
         self._enable_smtc = enable_smtc
+        self._auto_reconnect = auto_reconnect
 
         self._process = ProcessManager(
             build_dir=self._build_dir,
@@ -149,7 +151,6 @@ class BridgeEngine:
           state_changed(connection: ConnectionState)
           metadata(meta: MediaMetadata)
           playback(status: PlaybackStatus)
-          volume(percent: int)
           cover_art(path: Path)
           stream_started()
           stream_stopped()
@@ -189,9 +190,28 @@ class BridgeEngine:
             self._set_connection(ConnectionState.IDLE)
             raise
 
+    # Grace period for bt_bridge to complete HCI shutdown
+    SHUTDOWN_GRACE_PERIOD = 1.5
+
     async def stop(self) -> None:
-        """Shut down everything cleanly."""
+        """Shut down everything cleanly.
+
+        Sends a 'shutdown' command to bt_bridge first, giving it time to
+        cleanly disconnect from the iPhone (HCI power off) before killing
+        the process. Without this, the iPhone sees a phantom connection
+        until its supervision timeout expires (~20s).
+        """
         logger.info("Engine stopping")
+
+        # Tell bt_bridge to power off HCI (clean BT disconnect)
+        if self._ipc.connected:
+            try:
+                await self._ipc.send_command("shutdown")
+                logger.info("Shutdown command sent, waiting for HCI power off")
+                await asyncio.sleep(self.SHUTDOWN_GRACE_PERIOD)
+            except Exception:
+                logger.warning("Failed to send shutdown command")
+
         await self._ipc.disconnect()
         await self._process.stop()
         if self._smtc:
@@ -222,11 +242,13 @@ class BridgeEngine:
     async def prev_track(self) -> None:
         await self._ipc.send_command("prev")
 
-    async def volume_up(self) -> None:
-        await self._ipc.send_command("volume_up")
+    async def disconnect_bt(self) -> None:
+        """Disconnect the BT device but keep the engine running (discoverable)."""
+        await self._ipc.send_command("disconnect")
 
-    async def volume_down(self) -> None:
-        await self._ipc.send_command("volume_down")
+    async def connect_bt(self) -> None:
+        """Manually trigger connection to the last known device."""
+        await self._ipc.send_command("connect")
 
     async def request_metadata(self) -> None:
         await self._ipc.send_command("get_metadata")
@@ -297,7 +319,6 @@ class BridgeEngine:
     def _on_volume(self, _type: str, data: dict[str, Any]) -> None:
         self._state.volume_percent = data.get("percent", -1)
         logger.info("Volume: %d%%", self._state.volume_percent)
-        self._emit("volume", self._state.volume_percent)
 
     def _on_cover_art(self, _type: str, data: dict[str, Any]) -> None:
         rel_path = data.get("path", "")
@@ -330,6 +351,14 @@ class BridgeEngine:
 
     def _on_ipc_connected(self, _type: str, _data: dict[str, Any]) -> None:
         logger.info("IPC connection established")
+        # Send auto_reconnect preference to bt_bridge
+        if self._loop:
+            self._loop.create_task(
+                self._ipc.send_command(
+                    "set_auto_reconnect",
+                    enabled=self._auto_reconnect,
+                )
+            )
 
     def _on_ipc_disconnected(self, _type: str, _data: dict[str, Any]) -> None:
         logger.warning("IPC connection lost")

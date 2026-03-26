@@ -3,12 +3,18 @@ config.py — Persistent configuration for Bluetooth Media Bridge.
 
 Stores user preferences as JSON. Provides typed access with defaults.
 Config file location: same directory as the app package.
+
+Startup registration:
+  - Frozen (exe): registers exe path directly with --startup flag
+  - Script mode: uses pythonw.exe (if available) to avoid console window
+  - verify_startup_path(): auto-fixes registry if exe was moved
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -27,11 +33,11 @@ _DEFAULT_BUILD_DIR = (
 DEFAULTS: dict[str, Any] = {
     # Connection
     "auto_connect": True,
+    "auto_reconnect_last_device": True,  # auto-connect to last paired device on startup
     "build_dir": str(_DEFAULT_BUILD_DIR),
 
     # Audio
     "preferred_codec": "SBC",  # "SBC" or "AAC" (AAC not yet supported)
-
     # UI / Behavior
     "start_minimized": True,
     "launch_at_startup": False,
@@ -48,6 +54,112 @@ DEFAULTS: dict[str, Any] = {
     "log_max_lines": 5000,
 }
 
+
+# ── Windows startup registration helpers ───────────────────────────────────
+
+_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_REG_NAME = "BluetoothMediaBridge"
+
+
+def _get_startup_command() -> str:
+    """Build the correct startup command for the current environment."""
+    if getattr(sys, "frozen", False):
+        # Frozen (PyInstaller exe) — register exe directly
+        return f'"{sys.executable}" --startup'
+    else:
+        # Script mode — prefer pythonw.exe to avoid console window
+        python_dir = os.path.dirname(sys.executable)
+        pythonw = os.path.join(python_dir, "pythonw.exe")
+        if not os.path.exists(pythonw):
+            pythonw = sys.executable
+        main_py = str(Path(__file__).resolve().parent / "main.py")
+        return f'"{pythonw}" "{main_py}" --startup'
+
+
+def _is_startup_registered() -> bool:
+    """Check if the app is registered in Windows startup."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _REG_KEY, 0, winreg.KEY_READ
+        ) as key:
+            winreg.QueryValueEx(key, _REG_NAME)
+            return True
+    except Exception:
+        return False
+
+
+def _register_startup() -> bool:
+    """Register the app in Windows startup."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        cmd = _get_startup_command()
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _REG_KEY, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            winreg.SetValueEx(key, _REG_NAME, 0, winreg.REG_SZ, cmd)
+        logger.info("Startup registration added: %s", cmd)
+        return True
+    except Exception:
+        logger.exception("Failed to register startup")
+        return False
+
+
+def _unregister_startup() -> None:
+    """Remove the app from Windows startup."""
+    if sys.platform != "win32":
+        return
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _REG_KEY, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            winreg.DeleteValue(key, _REG_NAME)
+        logger.info("Startup registration removed")
+    except FileNotFoundError:
+        pass  # Already not registered
+    except Exception:
+        logger.exception("Failed to unregister startup")
+
+
+def verify_startup_path() -> None:
+    """
+    Auto-fix startup registry if the exe/script path has changed.
+
+    Call once at app startup. If the app is registered but the registered
+    command doesn't match the current path (e.g. exe was moved or updated),
+    the registration is silently updated.
+    """
+    if sys.platform != "win32":
+        return
+    if not _is_startup_registered():
+        return
+
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _REG_KEY, 0, winreg.KEY_READ
+        ) as key:
+            registered_cmd, _ = winreg.QueryValueEx(key, _REG_NAME)
+    except Exception:
+        return
+
+    expected_cmd = _get_startup_command()
+
+    # Case-insensitive comparison, ignoring quote variations
+    if registered_cmd.strip('"').lower() != expected_cmd.strip('"').lower():
+        logger.info(
+            "Startup path changed, updating: %s → %s",
+            registered_cmd, expected_cmd,
+        )
+        _register_startup()
+
+
+# ── AppConfig class ────────────────────────────────────────────────────────
 
 class AppConfig:
     """
@@ -112,42 +224,21 @@ class AppConfig:
         """Reset all settings to defaults."""
         self._data = dict(DEFAULTS)
 
-    # -- startup registration (Windows) --------------------------------------
+    # -- startup registration ------------------------------------------------
 
     def set_launch_at_startup(self, enabled: bool) -> None:
-        """Register/unregister from Windows startup via registry."""
+        """Register/unregister from Windows startup."""
         self["launch_at_startup"] = enabled
-        if sys.platform != "win32":
-            logger.warning("Startup registration only supported on Windows")
-            return
-        try:
-            import winreg
-            key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-            app_name = "BluetoothMediaBridge"
+        if enabled:
+            if not _register_startup():
+                logger.error("Failed to register startup")
+        else:
+            _unregister_startup()
 
-            if enabled:
-                # Get the Python executable and main module path
-                exe = sys.executable
-                main_module = str(
-                    Path(__file__).resolve().parent / "main.py"
-                )
-                cmd = f'"{exe}" "{main_module}"'
-                with winreg.OpenKey(
-                    winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE
-                ) as key:
-                    winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, cmd)
-                logger.info("Startup registration added: %s", cmd)
-            else:
-                with winreg.OpenKey(
-                    winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE
-                ) as key:
-                    try:
-                        winreg.DeleteValue(key, app_name)
-                        logger.info("Startup registration removed")
-                    except FileNotFoundError:
-                        pass
-        except Exception:
-            logger.exception("Failed to update startup registration")
+    @staticmethod
+    def is_startup_registered() -> bool:
+        """Check if currently registered in Windows startup."""
+        return _is_startup_registered()
 
     # -- repr ----------------------------------------------------------------
 

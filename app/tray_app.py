@@ -3,10 +3,15 @@ tray_app.py — System tray icon and menu for Bluetooth Media Bridge.
 
 Responsibilities:
   - Display connection state via tray icon color + tooltip
-  - Provide right-click context menu (status, reconnect, settings, quit)
+  - Provide right-click context menu with:
+    - Status display
+    - Engine start/stop toggle
+    - Disconnect BT (active only when device connected)
+    - Reconnect
+    - Settings
+    - Quit
   - Show Windows toast notifications on connect/disconnect
   - Manage tray icon lifecycle
-  - Coordinate with BridgeEngine for state updates
 """
 
 from __future__ import annotations
@@ -21,7 +26,6 @@ from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 if TYPE_CHECKING:
-    from .bridge_engine import BridgeEngine, ConnectionState, MediaMetadata
     from .config import AppConfig
 
 logger = logging.getLogger(__name__)
@@ -34,17 +38,20 @@ class TrayApp(QObject):
     """
     System tray icon with context menu.
 
-    Signals emitted to decouple from settings window:
+    Signals:
       - open_settings_requested: user clicked "Settings" or double-clicked tray
       - quit_requested: user clicked "Quit"
       - reconnect_requested: user clicked "Reconnect"
-      - toggle_connection_requested(bool): user toggled connection on/off
+      - toggle_connection_requested(bool): engine start (True) / stop (False)
+      - disconnect_requested: disconnect BT device only, keep engine running
     """
 
     open_settings_requested = Signal()
     quit_requested = Signal()
     reconnect_requested = Signal()
     toggle_connection_requested = Signal(bool)
+    connect_requested = Signal()
+    disconnect_requested = Signal()
 
     # Map ConnectionState enum names to icon filenames and tooltips
     _STATE_ICONS = {
@@ -57,13 +64,13 @@ class TrayApp(QObject):
 
     def __init__(
         self,
-        config: AppConfig,
+        config: "AppConfig",
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
         self._config = config
         self._current_state = "IDLE"
-        self._device_info = ""  # e.g. "iPhone (68:EF:DC:...)"
+        self._device_info = ""
 
         # Load icons
         self._icons: dict[str, QIcon] = {}
@@ -117,17 +124,9 @@ class TrayApp(QObject):
         self._refresh_menu_state()
 
     def notify(self, title: str, message: str, icon_type: str = "info") -> None:
-        """
-        Show a Windows toast notification via the tray icon.
-
-        Args:
-            title: Notification title
-            message: Notification body
-            icon_type: "info", "warning", or "error"
-        """
+        """Show a Windows toast notification via the tray icon."""
         if not self._config.get("show_notifications", True):
             return
-
         icon_map = {
             "info": QSystemTrayIcon.MessageIcon.Information,
             "warning": QSystemTrayIcon.MessageIcon.Warning,
@@ -143,12 +142,10 @@ class TrayApp(QObject):
         for state_name, (icon_base, _) in self._STATE_ICONS.items():
             if icon_base not in self._icons:
                 self._icons[icon_base] = self._load_icon_file(icon_base)
-
-        # Also load error icon
         self._icons["tray_error"] = self._load_icon_file("tray_error")
 
     def _load_icon_file(self, name: str) -> QIcon:
-        """Load an icon from the resources directory. Try .ico then .png."""
+        """Load an icon from the resources directory."""
         for ext in (".ico", ".png"):
             path = _ICON_DIR / f"{name}{ext}"
             if path.is_file():
@@ -176,10 +173,22 @@ class TrayApp(QObject):
 
         self._menu.addSeparator()
 
-        # Connection toggle
-        self._connect_action = QAction("Connect", self._menu)
-        self._connect_action.triggered.connect(self._on_connect_toggle)
+        # Engine start/stop
+        self._engine_action = QAction("Start Engine", self._menu)
+        self._engine_action.triggered.connect(self._on_engine_toggle)
+        self._menu.addAction(self._engine_action)
+
+        # Connect Device (when engine running but not connected)
+        self._connect_action = QAction("Connect Device", self._menu)
+        self._connect_action.triggered.connect(self.connect_requested.emit)
+        self._connect_action.setVisible(False)
         self._menu.addAction(self._connect_action)
+
+        # Disconnect BT (only when connected)
+        self._disconnect_action = QAction("Disconnect Device", self._menu)
+        self._disconnect_action.triggered.connect(self.disconnect_requested.emit)
+        self._disconnect_action.setVisible(False)
+        self._menu.addAction(self._disconnect_action)
 
         # Reconnect
         self._reconnect_action = QAction("Reconnect", self._menu)
@@ -210,6 +219,7 @@ class TrayApp(QObject):
 
         is_connected = self._current_state in ("CONNECTED", "STREAMING")
         is_running = self._current_state not in ("IDLE",)
+        is_ready = self._current_state == "READY"
 
         # Device info
         if is_connected and self._device_info:
@@ -218,13 +228,17 @@ class TrayApp(QObject):
         else:
             self._device_action.setVisible(False)
 
-        # Connect/Disconnect toggle
-        if is_running:
-            self._connect_action.setText("Disconnect")
-        else:
-            self._connect_action.setText("Connect")
+        # Engine start/stop
+        self._engine_action.setText("Stop Engine" if is_running else "Start Engine")
 
-        # Reconnect visible only when running
+        # Connect — visible when engine running but not connected
+        self._connect_action.setVisible(is_running and not is_connected)
+        self._connect_action.setEnabled(is_ready)
+
+        # Disconnect — visible only when connected
+        self._disconnect_action.setVisible(is_connected)
+
+        # Reconnect — visible only when engine is running
         self._reconnect_action.setVisible(is_running)
 
     # -- event handlers ------------------------------------------------------
@@ -234,10 +248,9 @@ class TrayApp(QObject):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self.open_settings_requested.emit()
         elif reason == QSystemTrayIcon.ActivationReason.Trigger:
-            # Single click on Windows — also open settings
             self.open_settings_requested.emit()
 
-    def _on_connect_toggle(self) -> None:
-        """Handle Connect/Disconnect menu action."""
+    def _on_engine_toggle(self) -> None:
+        """Handle Start/Stop Engine menu action."""
         is_running = self._current_state not in ("IDLE",)
         self.toggle_connection_requested.emit(not is_running)

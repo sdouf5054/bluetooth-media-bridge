@@ -5,12 +5,18 @@ Responsibilities:
   - Initialize QApplication + asyncio event loop (via qasync)
   - Create and wire: BridgeEngine, TrayApp, SettingsWindow, LogWindow
   - Bridge engine callbacks (plain Python) → Qt signals (thread-safe)
-  - Handle startup options (--minimized, --ipc-only, --build-dir)
+  - Handle startup options (--minimized, --startup, --ipc-only, --build-dir)
   - Graceful shutdown on quit
+
+Startup modes:
+  --startup    Launched by Windows startup registration. Implies --minimized.
+               Starts hidden to tray, engine auto-connects.
+  --minimized  Start minimized to system tray (no main window shown).
 
 Usage:
     python -m app.main
     python -m app.main --minimized
+    python -m app.main --startup
     python -m app.main --ipc-only
     python -m app.main --build-dir "C:\\path\\to\\build"
 """
@@ -37,7 +43,7 @@ from app.bridge_engine import (
     MediaMetadata,
     PlaybackStatus,
 )
-from app.config import AppConfig
+from app.config import AppConfig, verify_startup_path
 from app.log_window import LogWindow
 from app.settings_window import SettingsWindow
 from app.tray_app import TrayApp
@@ -73,7 +79,6 @@ class _EngineBridge(QObject):
     state_changed = Signal(str, str)     # (state_name, device_info)
     metadata_changed = Signal(str, str, str)  # (title, artist, album)
     playback_changed = Signal(str)       # status string
-    volume_changed = Signal(int)         # percent
     cover_art_ready = Signal(str)        # file path as string
     stream_started = Signal()
     stream_stopped = Signal()
@@ -89,7 +94,6 @@ class _EngineBridge(QObject):
         engine.on("state_changed", self._on_state)
         engine.on("metadata", self._on_metadata)
         engine.on("playback", self._on_playback)
-        engine.on("volume", self._on_volume)
         engine.on("cover_art", self._on_cover_art)
         engine.on("stream_started", self._on_stream_started)
         engine.on("stream_stopped", self._on_stream_stopped)
@@ -110,9 +114,6 @@ class _EngineBridge(QObject):
 
     def _on_playback(self, status: PlaybackStatus) -> None:
         self.playback_changed.emit(status.value)
-
-    def _on_volume(self, percent: int) -> None:
-        self.volume_changed.emit(percent)
 
     def _on_cover_art(self, path: Path) -> None:
         self.cover_art_ready.emit(str(path))
@@ -153,6 +154,7 @@ class Application:
         self._engine = BridgeEngine(
             build_dir=build_dir,
             enable_smtc=not args.no_smtc,
+            auto_reconnect=self._config.get("auto_reconnect_last_device", True),
         )
 
         # Qt components
@@ -180,7 +182,6 @@ class Application:
 
         # Engine bridge → Settings window
         bridge.state_changed.connect(settings.update_connection_state)
-        bridge.volume_changed.connect(settings.update_volume)
         bridge.state_changed.connect(self._on_state_for_device_info)
 
         # Engine bridge → Log window
@@ -194,9 +195,6 @@ class Application:
         bridge.playback_changed.connect(
             lambda s: log_win.append_line(f"[engine] Playback → {s}")
         )
-        bridge.volume_changed.connect(
-            lambda v: log_win.append_line(f"[engine] Volume → {v}%")
-        )
         bridge.process_exited.connect(
             lambda c: log_win.append_line(f"[engine] Process exited (code={c})")
         )
@@ -206,11 +204,14 @@ class Application:
         tray.quit_requested.connect(self._quit)
         tray.reconnect_requested.connect(self._reconnect)
         tray.toggle_connection_requested.connect(self._toggle_connection)
+        tray.connect_requested.connect(self._connect_bt)
+        tray.disconnect_requested.connect(self._disconnect_bt)
 
         # Settings → Actions
         settings.open_log_requested.connect(log_win.show_and_raise)
         settings.connection_toggled.connect(self._toggle_connection)
-        settings.volume_changed.connect(self._on_volume_from_ui)
+        settings.connect_requested.connect(self._connect_bt)
+        settings.disconnect_requested.connect(self._disconnect_bt)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -220,9 +221,13 @@ class Application:
 
         self._tray.show()
 
-        # Show settings window unless --minimized
+        # Determine if we should start minimized:
+        # --startup flag (from Windows startup) implies minimized
+        # --minimized flag explicitly requests it
+        # config start_minimized is the default preference
         start_minimized = (
-            self._args.minimized
+            self._args.startup
+            or self._args.minimized
             or self._config.get("start_minimized", False)
         )
         if not start_minimized:
@@ -258,6 +263,10 @@ class Application:
             await self._engine.stop()
             self._engine_running = False
             self._settings.clear_device_info()
+            # Ensure UI reflects IDLE state even if engine events
+            # arrived out of order during shutdown
+            self._settings.update_connection_state("IDLE", "")
+            self._tray.update_state("IDLE", "")
 
     # ── Slot handlers (schedule async work from Qt signals) ─────────────────
 
@@ -282,13 +291,23 @@ class Application:
 
         asyncio.ensure_future(_do_reconnect(), loop=self._loop)
 
-    def _on_volume_from_ui(self, percent: int) -> None:
-        """Forward volume slider changes to engine as IPC commands."""
-        # bt_bridge only supports volume_up/volume_down commands,
-        # not absolute volume set. We could send multiple step commands,
-        # but for now we just log it. Absolute volume control would
-        # require a C-side change.
-        pass
+    def _disconnect_bt(self) -> None:
+        """Disconnect BT device but keep engine running."""
+        if self._loop is None or not self._engine_running:
+            return
+        self._log_win.append_line("[app] Disconnecting BT device...")
+        asyncio.ensure_future(
+            self._engine.disconnect_bt(), loop=self._loop
+        )
+
+    def _connect_bt(self) -> None:
+        """Manually trigger BT connection to last known device."""
+        if self._loop is None or not self._engine_running:
+            return
+        self._log_win.append_line("[app] Connecting to last device...")
+        asyncio.ensure_future(
+            self._engine.connect_bt(), loop=self._loop
+        )
 
     def _on_state_for_device_info(self, state_name: str, _device_info: str) -> None:
         """Update settings window device info based on engine state."""
@@ -338,6 +357,11 @@ def parse_args() -> argparse.Namespace:
         help="Start minimized to system tray",
     )
     parser.add_argument(
+        "--startup",
+        action="store_true",
+        help="Launched by Windows startup (implies --minimized)",
+    )
+    parser.add_argument(
         "--no-smtc",
         action="store_true",
         help="Disable SMTC integration",
@@ -353,12 +377,19 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    # --startup implies --minimized
+    if args.startup:
+        args.minimized = True
+
     # Logging
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # Verify startup registration path (auto-fix if exe was moved)
+    verify_startup_path()
 
     # Windows app identity (must be before QApplication)
     _set_app_id()

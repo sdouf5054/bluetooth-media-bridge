@@ -2,18 +2,16 @@
 settings_window.py — Compact settings window for Bluetooth Media Bridge.
 
 Responsibilities:
-  - Show connection status and device info
-  - Volume slider (synced with BT device volume)
-  - Codec selection, startup, minimize options
+  - Show connection status and device info (engine start/stop + connect/disconnect)
+  - Codec selection, startup, minimize, auto-reconnect options
   - "Debug log" button opens LogWindow
   - Close button → hide to tray (not quit)
 
 Layout sections (top to bottom):
   1. Title bar with app name + connection indicator
-  2. Connection card (status, device, address, codec)
-  3. Volume slider
-  4. Options (codec, launch at startup, start minimized)
-  5. Footer (debug log button, version)
+  2. Connection card (status, device, address, codec) + engine/connect buttons
+  3. Options (codec, launch at startup, start minimized, auto-reconnect)
+  4. Footer (debug log button, version)
 """
 
 from __future__ import annotations
@@ -31,7 +29,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QSlider,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -77,16 +74,18 @@ class SettingsWindow(QWidget):
     Compact settings window.
 
     Signals:
-      - volume_changed(int): user moved volume slider (0-100)
       - codec_changed(str): user selected a different codec
-      - connection_toggled(bool): user toggled connect/disconnect
+      - connection_toggled(bool): engine start (True) / stop (False)
+      - connect_requested: manually trigger BT connection
+      - disconnect_requested: disconnect BT only, keep engine
       - open_log_requested: user clicked "Debug log"
       - closed: window was closed (hidden to tray)
     """
 
-    volume_changed = Signal(int)
     codec_changed = Signal(str)
-    connection_toggled = Signal(bool)
+    connection_toggled = Signal(bool)       # engine start (True) / stop (False)
+    connect_requested = Signal()            # manually trigger BT connection
+    disconnect_requested = Signal()         # disconnect BT only, keep engine
     open_log_requested = Signal()
     closed = Signal()
 
@@ -100,6 +99,7 @@ class SettingsWindow(QWidget):
         super().__init__(parent)
         self._config = config
         self._is_connected = False
+        self._current_state = "IDLE"
 
         self.setWindowTitle("Bluetooth Media Bridge")
         self.setFixedWidth(380)
@@ -113,6 +113,9 @@ class SettingsWindow(QWidget):
         self._build_ui()
         self._apply_stylesheet()
         self._load_config()
+
+        # Set initial button state
+        self.update_connection_state("IDLE")
 
         # Restore window position
         x, y = config.get("window_x", -1), config.get("window_y", -1)
@@ -147,21 +150,35 @@ class SettingsWindow(QWidget):
         conn_group = QGroupBox("Connection")
         conn_layout = QVBoxLayout(conn_group)
         conn_layout.setContentsMargins(12, 12, 12, 12)
-        conn_layout.setSpacing(6)
+        conn_layout.setSpacing(8)
 
-        # Toggle + status row
-        toggle_row = QHBoxLayout()
-        self._conn_toggle = QPushButton("Connect")
-        self._conn_toggle.setFixedWidth(100)
-        self._conn_toggle.setCheckable(True)
-        self._conn_toggle.clicked.connect(self._on_connection_toggle)
-        toggle_row.addWidget(self._conn_toggle)
-        toggle_row.addStretch()
+        # Button row: Engine toggle + Connect/Disconnect
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
 
+        self._engine_btn = QPushButton("▶  Start")
+        self._engine_btn.setObjectName("engineBtn")
+        self._engine_btn.setFixedHeight(32)
+        self._engine_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._engine_btn.clicked.connect(self._on_engine_toggle)
+        btn_row.addWidget(self._engine_btn, 1)
+
+        # This button changes role: Connect (READY) / Disconnect (CONNECTED)
+        self._conn_action_btn = QPushButton("Connect")
+        self._conn_action_btn.setObjectName("connActionBtn")
+        self._conn_action_btn.setFixedHeight(32)
+        self._conn_action_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._conn_action_btn.setVisible(False)  # hidden in IDLE
+        self._conn_action_btn.clicked.connect(self._on_conn_action)
+        btn_row.addWidget(self._conn_action_btn, 1)
+
+        conn_layout.addLayout(btn_row)
+
+        # Status label
         self._status_label = QLabel("Idle")
         self._status_label.setObjectName("statusLabel")
-        toggle_row.addWidget(self._status_label)
-        conn_layout.addLayout(toggle_row)
+        self._status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        conn_layout.addWidget(self._status_label)
 
         # Info grid
         self._info_frame = QFrame()
@@ -183,25 +200,6 @@ class SettingsWindow(QWidget):
 
         conn_layout.addWidget(self._info_frame)
         root.addWidget(conn_group)
-
-        # -- Volume section --------------------------------------------------
-        vol_group = QGroupBox("Volume")
-        vol_layout = QHBoxLayout(vol_group)
-        vol_layout.setContentsMargins(12, 12, 12, 12)
-
-        self._vol_slider = QSlider(Qt.Orientation.Horizontal)
-        self._vol_slider.setRange(0, 100)
-        self._vol_slider.setValue(0)
-        self._vol_slider.setTickPosition(QSlider.TickPosition.NoTicks)
-        self._vol_slider.valueChanged.connect(self._on_volume_slider)
-        vol_layout.addWidget(self._vol_slider, 1)
-
-        self._vol_label = QLabel("—")
-        self._vol_label.setFixedWidth(36)
-        self._vol_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        vol_layout.addWidget(self._vol_label)
-
-        root.addWidget(vol_group)
 
         # -- Options section -------------------------------------------------
         opt_group = QGroupBox("Options")
@@ -231,6 +229,11 @@ class SettingsWindow(QWidget):
         self._minimized_cb = QCheckBox("Start minimized to tray")
         self._minimized_cb.toggled.connect(self._on_minimized_toggled)
         opt_layout.addWidget(self._minimized_cb)
+
+        # Auto-reconnect to last device
+        self._auto_reconnect_cb = QCheckBox("Auto-connect to last device on startup")
+        self._auto_reconnect_cb.toggled.connect(self._on_auto_reconnect_toggled)
+        opt_layout.addWidget(self._auto_reconnect_cb)
 
         root.addWidget(opt_group)
 
@@ -307,22 +310,14 @@ class SettingsWindow(QWidget):
             QPushButton:hover {
                 background-color: palette(midlight);
             }
-            QPushButton:checked {
-                background-color: palette(highlight);
-                color: palette(highlighted-text);
-                border-color: palette(highlight);
-            }
-            QSlider::groove:horizontal {
-                height: 4px;
-                background: palette(mid);
-                border-radius: 2px;
-            }
-            QSlider::handle:horizontal {
-                background: palette(highlight);
-                width: 14px;
-                height: 14px;
-                margin: -5px 0;
-                border-radius: 7px;
+            /* Engine and Connect/Disconnect buttons — styled dynamically */
+            #engineBtn, #connActionBtn {
+                font-weight: 600;
+                font-size: 12px;
+                border-radius: 6px;
+                padding: 5px 12px;
+                border: none;
+                color: white;
             }
             QComboBox {
                 padding: 3px 8px;
@@ -342,12 +337,14 @@ class SettingsWindow(QWidget):
 
         self._startup_cb.setChecked(self._config.get("launch_at_startup", False))
         self._minimized_cb.setChecked(self._config.get("start_minimized", True))
+        self._auto_reconnect_cb.setChecked(self._config.get("auto_reconnect_last_device", True))
 
     def _save_config(self) -> None:
         """Persist current settings."""
         self._config["preferred_codec"] = self._codec_combo.currentText()
         self._config["launch_at_startup"] = self._startup_cb.isChecked()
         self._config["start_minimized"] = self._minimized_cb.isChecked()
+        self._config["auto_reconnect_last_device"] = self._auto_reconnect_cb.isChecked()
 
         pos = self.pos()
         self._config["window_x"] = pos.x()
@@ -365,6 +362,7 @@ class SettingsWindow(QWidget):
     ) -> None:
         """Update all connection-related UI elements."""
         self._status_dot.set_state(state_name)
+        self._current_state = state_name
 
         is_connected = state_name in ("CONNECTED", "STREAMING")
         is_running = state_name not in ("IDLE",)
@@ -380,9 +378,71 @@ class SettingsWindow(QWidget):
         }
         self._status_label.setText(status_map.get(state_name, state_name))
 
-        # Toggle button
-        self._conn_toggle.setChecked(is_running)
-        self._conn_toggle.setText("Disconnect" if is_running else "Connect")
+        # ── Engine button ──
+        if is_running:
+            self._engine_btn.setText("■  Stop")
+            self._engine_btn.setStyleSheet("""
+                #engineBtn {
+                    background-color: #6B7280; color: white;
+                    border: none; border-radius: 6px;
+                    font-weight: 600; font-size: 12px; padding: 5px 12px;
+                }
+                #engineBtn:hover { background-color: #5B636E; }
+            """)
+        else:
+            self._engine_btn.setText("▶  Start")
+            self._engine_btn.setStyleSheet("""
+                #engineBtn {
+                    background-color: #2D8C5A; color: white;
+                    border: none; border-radius: 6px;
+                    font-weight: 600; font-size: 12px; padding: 5px 12px;
+                }
+                #engineBtn:hover { background-color: #248A50; }
+            """)
+
+        # ── Connect / Disconnect button ──
+        if state_name == "IDLE":
+            # Engine off — hide the action button entirely
+            self._conn_action_btn.setVisible(False)
+
+        elif is_connected:
+            # Device connected — show Disconnect (red)
+            self._conn_action_btn.setText("Disconnect")
+            self._conn_action_btn.setVisible(True)
+            self._conn_action_btn.setEnabled(True)
+            self._conn_action_btn.setStyleSheet("""
+                #connActionBtn {
+                    background-color: #DC4C4C; color: white;
+                    border: none; border-radius: 6px;
+                    font-weight: 600; font-size: 12px; padding: 5px 12px;
+                }
+                #connActionBtn:hover { background-color: #C43E3E; }
+            """)
+
+        else:
+            # Engine running but not connected (READY / INITIALIZING)
+            # Show Connect button (blue) to manually trigger reconnection
+            self._conn_action_btn.setText("Connect")
+            self._conn_action_btn.setVisible(True)
+            self._conn_action_btn.setEnabled(state_name == "READY")
+            if state_name == "READY":
+                self._conn_action_btn.setStyleSheet("""
+                    #connActionBtn {
+                        background-color: #378ADD; color: white;
+                        border: none; border-radius: 6px;
+                        font-weight: 600; font-size: 12px; padding: 5px 12px;
+                    }
+                    #connActionBtn:hover { background-color: #2E78C4; }
+                """)
+            else:
+                # INITIALIZING — show but disabled
+                self._conn_action_btn.setStyleSheet("""
+                    #connActionBtn {
+                        background-color: #A0AEC0; color: white;
+                        border: none; border-radius: 6px;
+                        font-weight: 600; font-size: 12px; padding: 5px 12px;
+                    }
+                """)
 
     @Slot(str, str, str)
     def update_device_info(
@@ -397,27 +457,22 @@ class SettingsWindow(QWidget):
         self._codec_row[1].setText(codec or "—")
 
     @Slot(int)
-    def update_volume(self, percent: int) -> None:
-        """Update volume slider from engine (without re-emitting signal)."""
-        self._vol_slider.blockSignals(True)
-        self._vol_slider.setValue(percent)
-        self._vol_slider.blockSignals(False)
-        self._vol_label.setText(f"{percent}%")
-
     def clear_device_info(self) -> None:
         """Reset device info to defaults (on disconnect)."""
         self.update_device_info("—", "—", "—")
-        self.update_volume(0)
-        self._vol_label.setText("—")
 
     # ── Internal handlers ───────────────────────────────────────────────────
 
-    def _on_connection_toggle(self, checked: bool) -> None:
-        self.connection_toggled.emit(checked)
+    def _on_engine_toggle(self) -> None:
+        is_running = getattr(self, '_current_state', 'IDLE') != 'IDLE'
+        self.connection_toggled.emit(not is_running)
 
-    def _on_volume_slider(self, value: int) -> None:
-        self._vol_label.setText(f"{value}%")
-        self.volume_changed.emit(value)
+    def _on_conn_action(self) -> None:
+        """Handle the Connect/Disconnect button based on current state."""
+        if self._is_connected:
+            self.disconnect_requested.emit()
+        else:
+            self.connect_requested.emit()
 
     def _on_codec_changed(self, text: str) -> None:
         self._config["preferred_codec"] = text
@@ -430,6 +485,10 @@ class SettingsWindow(QWidget):
 
     def _on_minimized_toggled(self, checked: bool) -> None:
         self._config["start_minimized"] = checked
+        self._config.save()
+
+    def _on_auto_reconnect_toggled(self, checked: bool) -> None:
+        self._config["auto_reconnect_last_device"] = checked
         self._config.save()
 
     # ── Window events ───────────────────────────────────────────────────────

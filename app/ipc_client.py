@@ -121,16 +121,23 @@ class IPCClient:
 
     # -- sending commands ----------------------------------------------------
 
-    async def send_command(self, cmd: str) -> None:
-        """Send a command to bt_bridge. e.g. send_command('play')."""
+    async def send_command(self, cmd: str, **kwargs: Any) -> None:
+        """
+        Send a command to bt_bridge.
+
+        Simple:   send_command('play')       → {"cmd":"play"}
+        With args: send_command('set_volume', value=81) → {"cmd":"set_volume","value":81}
+        """
         if not self._connected or self._writer is None:
             logger.warning("Cannot send command '%s' — not connected", cmd)
             return
-        payload = json.dumps({"cmd": cmd}) + "\n"
+        payload_dict: dict[str, Any] = {"cmd": cmd}
+        payload_dict.update(kwargs)
+        payload = json.dumps(payload_dict) + "\n"
         try:
             self._writer.write(payload.encode("utf-8"))
             await self._writer.drain()
-            logger.debug("IPC sent: %s", cmd)
+            logger.debug("IPC sent: %s", payload_dict)
         except (ConnectionError, OSError) as e:
             logger.error("IPC send failed: %s", e)
             await self._handle_disconnect()
