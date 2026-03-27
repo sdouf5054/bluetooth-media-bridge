@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Optional
+import sys
+from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, Slot, QSize
 from PySide6.QtGui import QCloseEvent, QIcon, QFont
@@ -96,6 +98,11 @@ class SettingsWindow(QWidget):
         self._current_state = "IDLE"
 
         self.setWindowTitle("Bluetooth Media Bridge")
+        # 윈도우(작업표시줄) 아이콘
+        # _app_dir = Path(__file__).resolve().parent
+        icon_path = Path(__file__).resolve().parent / "assets" / "simple" / "ico.ico"
+        if icon_path.is_file():
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.setFixedWidth(380)
         self.setMinimumHeight(400)
         self.setWindowFlags(

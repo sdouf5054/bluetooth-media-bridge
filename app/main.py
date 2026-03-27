@@ -431,6 +431,13 @@ def main() -> None:
     qt_app.setApplicationName("Bluetooth Media Bridge")
     qt_app.setQuitOnLastWindowClosed(False)
 
+    # 작업표시줄 아이콘 설정
+    from PySide6.QtGui import QIcon
+    from pathlib import Path
+    icon_path = Path(__file__).resolve().parent / "assets" / "simple" / "icon.ico"
+    if icon_path.is_file():
+        qt_app.setWindowIcon(QIcon(str(icon_path)))
+
     try:
         import qasync
     except ImportError:
