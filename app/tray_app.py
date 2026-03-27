@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Icon resource directory
-_ICON_DIR = Path(__file__).resolve().parent / "assets"
+_ICON_DIR = Path(__file__).resolve().parent / "assets/round"
 
 
 class TrayApp(QObject):

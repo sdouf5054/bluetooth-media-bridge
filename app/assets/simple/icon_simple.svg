@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1368" height="1347" viewBox="340 319 1368 1347">
+
+  <!-- ===== 재생 삼각형 ▷ (정삼각형, 블루투스 안으로 살짝 겹침) ===== -->
+  <polygon
+    points="530,705 530,1279 1020,992"
+    fill="#0082FC"
+    stroke="#0082FC"
+    stroke-width="80"
+    stroke-linejoin="round"
+    stroke-linecap="round"
+  />
+
+  <!-- ===== 블루투스 심볼 ===== -->
+  <g stroke="#0082FC" stroke-width="78" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <line x1="1270" y1="512" x2="1270" y2="1472"/>
+    <polyline points="1270,512 1520,734 1270,992"/>
+    <polyline points="1270,992 1520,1250 1270,1472"/>
+    <line x1="1270" y1="992" x2="1020" y2="734"/>
+    <line x1="1270" y1="992" x2="1020" y2="1250"/>
+  </g>
+
+</svg>
