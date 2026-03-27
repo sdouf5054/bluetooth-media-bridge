@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Icon resource directory
-_ICON_DIR = Path(__file__).resolve().parent / "resources"
+_ICON_DIR = Path(__file__).resolve().parent / "assets"
 
 
 class TrayApp(QObject):
@@ -145,7 +145,7 @@ class TrayApp(QObject):
         self._icons["tray_error"] = self._load_icon_file("tray_error")
 
     def _load_icon_file(self, name: str) -> QIcon:
-        """Load an icon from the resources directory."""
+        """Load an icon from the assets directory."""
         for ext in (".ico", ".png"):
             path = _ICON_DIR / f"{name}{ext}"
             if path.is_file():
