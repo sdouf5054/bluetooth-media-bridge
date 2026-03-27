@@ -106,6 +106,7 @@ class ProcessManager:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "PATH": os.environ.get("PATH", "") + r";C:\msys64\mingw64\bin"},
             # CREATE_NO_WINDOW: hide console window
             # Note: CREATE_NEW_PROCESS_GROUP can cause ACCESS_VIOLATION
             # when btstack_stdin_windows tries to access console input
