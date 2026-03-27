@@ -32,7 +32,7 @@ class ConnectionState(Enum):
     IDLE = auto()          # exe not running
     INITIALIZING = auto()  # exe running, waiting for 'ready'
     READY = auto()         # btstack initialized, discoverable
-    CONNECTED = auto()     # iPhone connected
+    CONNECTED = auto()     # iPhone connected (A2DP established, audio ready)
     STREAMING = auto()     # A2DP audio streaming
 
 
@@ -71,11 +71,11 @@ class BridgeState:
     connection: ConnectionState = ConnectionState.IDLE
     playback: PlaybackStatus = PlaybackStatus.UNKNOWN
     metadata: MediaMetadata = field(default_factory=MediaMetadata)
-    volume_percent: int = -1
     device_addr: str = ""        # connected iPhone address
     local_addr: str = ""         # dongle BT address
     cover_art_path: Optional[Path] = None
     codec: str = ""              # active codec: "SBC", "AAC", or ""
+    avrcp_ready: bool = False    # True once AVRCP control channel is up
 
 
 class BridgeEngine:
@@ -124,11 +124,11 @@ class BridgeEngine:
 
         # Register IPC event handlers
         self._ipc.on("ready", self._on_ready)
+        self._ipc.on("a2dp_connected", self._on_a2dp_connected)
         self._ipc.on("connected", self._on_bt_connected)
         self._ipc.on("disconnected", self._on_bt_disconnected)
         self._ipc.on("metadata", self._on_metadata)
         self._ipc.on("playback", self._on_playback)
-        self._ipc.on("volume", self._on_volume)
         self._ipc.on("cover_art", self._on_cover_art)
         self._ipc.on("stream_started", self._on_stream_started)
         self._ipc.on("stream_stopped", self._on_stream_stopped)
@@ -281,10 +281,36 @@ class BridgeEngine:
         self._set_connection(ConnectionState.READY)
         logger.info("btstack ready, local addr: %s", self._state.local_addr)
 
-    def _on_bt_connected(self, _type: str, data: dict[str, Any]) -> None:
+    def _on_a2dp_connected(self, _type: str, data: dict[str, Any]) -> None:
+        """Handle A2DP-level connection (fires before AVRCP).
+
+        This is the earliest point where audio can flow. Transition to
+        CONNECTED immediately so the GUI reflects the phone's state without
+        waiting for the slower AVRCP handshake.
+        """
         self._state.device_addr = data.get("addr", "")
+        self._state.avrcp_ready = False
         self._set_connection(ConnectionState.CONNECTED)
-        logger.info("iPhone connected: %s", self._state.device_addr)
+        logger.info("A2DP connected: %s (AVRCP pending)", self._state.device_addr)
+
+    def _on_bt_connected(self, _type: str, data: dict[str, Any]) -> None:
+        """Handle AVRCP-level connection (fires after A2DP).
+
+        At this point media controls (play/pause/next/prev) become available.
+        If we're already CONNECTED or STREAMING from the A2DP event, just
+        mark AVRCP as ready — no state transition needed.
+        """
+        addr = data.get("addr", "")
+        self._state.avrcp_ready = True
+
+        if self._state.connection in (ConnectionState.CONNECTED, ConnectionState.STREAMING):
+            # Already connected via a2dp_connected — just log AVRCP arrival
+            logger.info("AVRCP connected: %s (media controls ready)", addr)
+        else:
+            # Fallback: if a2dp_connected was somehow missed, connect now
+            self._state.device_addr = addr
+            self._set_connection(ConnectionState.CONNECTED)
+            logger.info("AVRCP connected (fallback): %s", addr)
 
     def _on_bt_disconnected(self, _type: str, _data: dict[str, Any]) -> None:
         self._state.device_addr = ""
@@ -292,6 +318,7 @@ class BridgeEngine:
         self._state.playback = PlaybackStatus.UNKNOWN
         self._state.cover_art_path = None
         self._state.codec = ""
+        self._state.avrcp_ready = False
         self._set_connection(ConnectionState.READY)
         if self._smtc:
             self._smtc.clear_display()
@@ -326,10 +353,6 @@ class BridgeEngine:
         if self._smtc:
             self._smtc.update_playback_status(self._state.playback.value)
         self._emit("playback", self._state.playback)
-
-    def _on_volume(self, _type: str, data: dict[str, Any]) -> None:
-        self._state.volume_percent = data.get("percent", -1)
-        logger.info("Volume: %d%%", self._state.volume_percent)
 
     def _on_cover_art(self, _type: str, data: dict[str, Any]) -> None:
         rel_path = data.get("path", "")
