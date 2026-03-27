@@ -35,6 +35,7 @@ from app.config import AppConfig, verify_startup_path
 from app.log_window import LogWindow
 from app.settings_window import SettingsWindow
 from app.tray_app import TrayApp
+from app.single_instance import acquire_mutex, signal_existing_instance, EVENT_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -154,8 +155,29 @@ class Application:
         # Engine → Qt bridge
         self._bridge = _EngineBridge(self._engine)
 
+        # ── 단일 인스턴스: show-window 이벤트 폴링 ──
+        self._show_event_handle = ctypes.windll.kernel32.CreateEventW(
+            None, True, False, EVENT_NAME  # manual-reset, initially non-signaled
+        )
+        self._show_event_timer = QTimer()
+        self._show_event_timer.timeout.connect(self._check_show_event)
+        self._show_event_timer.start(500)
+
         # Wire everything
         self._connect_signals()
+
+    def _check_show_event(self) -> None:
+        """500ms마다 폴링 — 두 번째 인스턴스가 신호를 보냈으면 창 표시."""
+        if not self._show_event_handle:
+            return
+        # timeout=0: 블로킹 없이 즉시 확인
+        result = ctypes.windll.kernel32.WaitForSingleObject(
+            self._show_event_handle, 0
+        )
+        if result == 0:  # WAIT_OBJECT_0 = signaled
+            ctypes.windll.kernel32.ResetEvent(self._show_event_handle)
+            logger.info("Show signal received from another instance.")
+            self._settings.show_and_raise()
 
     def _connect_signals(self) -> None:
         """Connect all signals between components."""
@@ -314,7 +336,6 @@ class Application:
 
     def _on_codec_preference_changed(self, codec: str) -> None:
         """Handle codec selection change from settings UI."""
-        # Map UI values to bt_bridge --codec values
         codec_map = {"SBC": "SBC", "AAC": "both"}
         bt_codec = codec_map.get(codec, "both")
         self._engine.preferred_codec = bt_codec
@@ -327,6 +348,11 @@ class Application:
 
     def _quit(self) -> None:
         """Graceful shutdown."""
+        # 이벤트 핸들 정리
+        if self._show_event_handle:
+            ctypes.windll.kernel32.CloseHandle(self._show_event_handle)
+            self._show_event_handle = None
+
         if self._loop is None:
             QApplication.quit()
             return
@@ -389,6 +415,14 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # ── 단일 인스턴스 체크 ──────────────────────────────────────────────────
+    mutex = acquire_mutex()
+    if mutex is None:
+        logger.info("Another instance is already running. Signaling it to show.")
+        signal_existing_instance()
+        sys.exit(0)
+    # mutex는 프로세스 종료 시 OS가 자동 해제
 
     verify_startup_path()
     _set_app_id()
